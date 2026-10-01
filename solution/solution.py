@@ -17,7 +17,7 @@ Instructions:
     1. Fill in every required section marked with TODO.
     2. Do NOT change class/function signatures. The optional ``contexts``
        parameter in ``run_full_eval`` is part of the required interface.
-    3. Before submit, ensure this file matches your finished work (from repo root: cp template.py solution/solution.py). Prefer editing template.py then re-copy; if you edit this file directly, keep template.py in sync.
+    3. Copy this file to solution/solution.py when done.
     4. Run: pytest tests/ -v
 
 The reranking helper is an optional bonus exercise and may remain unimplemented.
@@ -25,6 +25,7 @@ The reranking helper is an optional bonus exercise and may remain unimplemented.
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -53,10 +54,16 @@ class QAPair:
         retrieved_contexts: List of retrieved chunks (ORDER = retriever rank).
                             Used by the retrieval-side metrics (Task 2b).
     """
-    question: str
+    #QAPair dữ liệu đầu vào
+    # Câu hỏi từ người dùng
+    question: str 
+    # Câu trả lời chuẩn (ground-truth) do chuyên gia con người viết sẵn
     expected_answer: str
+    # Ngữ cảnh/tài liệu nguồn chuẩn (gold evidence) chứa thông tin để trả lời câu hỏi
     context: str = ""
+    # metadata: Chứa nhãn phân loại (độ khó: easy, medium, hard, adversarial, danh mục sản phẩm, v.v.).
     metadata: dict = field(default_factory=dict)
+    # Danh sách các đoạn văn bản (chunks) mà Retriever của hệ thống RAG thực tế đã tìm được (xếp theo thứ tự rank điểm số).
     retrieved_contexts: list = field(default_factory=list)
 
 
@@ -88,11 +95,19 @@ class EvalResult:
                         (Both stay None unless retrieved chunks are supplied;
                          they are NOT part of overall_score().)
     """
+    # Dữ liệu đầu ra
+    # Tham chiếu ngược lại QAPair gốc để biết đang đánh giá câu hỏi nào.
     qa_pair: QAPair
+    # Câu trả lời thực tế từ LLM/agent
     actual_answer: str
+    #  Câu trả lời có bám sát context không, có bị "bịa đặt" (hallucination) không?0-1
     faithfulness: float
+    # Câu trả lời có trả lời đúng trọng tâm câu hỏi không0-1
     relevance: float
+    # Câu trả lời có đầy đủ ý so với expected_answer không?0-1
     completeness: float
+
+    # Đánh dấu qua/trượt (pass/fail) dựa trên ngưỡng (ví dụ: tất cả >= 0.5)
     passed: bool
     failure_type: str | None = None
     context_precision: float | None = None
@@ -161,8 +176,18 @@ class RAGASEvaluator:
         Returns:
             float in [0.0, 1.0] — 1.0 = fully grounded in context.
         """
-        # TODO
-        raise NotImplementedError("Implement evaluate_faithfulness")
+        # Tách các từ mang nội dung (bỏ stopwords) từ câu trả lời và context nguồn
+        answer_tokens = _tokenize(answer)
+        context_tokens = _tokenize(context)
+
+        # Nếu câu trả lời rỗng, coi như không bịa đặt (hallucination) -> trả về 1.0
+        if not answer_tokens:
+            return 1.0
+
+        # Tính tỷ lệ từ trong câu trả lời có bằng chứng trong context (độ trung thực / bám sát ngữ cảnh)
+        overlap = len(answer_tokens & context_tokens)
+        score = overlap / len(answer_tokens)
+        return max(0.0, min(1.0, float(score)))
 
     def evaluate_relevance(self, answer: str, question: str) -> float:
         """
@@ -175,8 +200,18 @@ class RAGASEvaluator:
         Returns:
             float in [0.0, 1.0]
         """
-        # TODO
-        raise NotImplementedError("Implement evaluate_relevance")
+        # Tách các từ mang nội dung từ câu trả lời và câu hỏi
+        answer_tokens = _tokenize(answer)
+        question_tokens = _tokenize(question)
+
+        # Nếu câu hỏi rỗng, trả về mặc định 1.0
+        if not question_tokens:
+            return 1.0
+
+        # Tính mức độ bao phủ các từ khóa câu hỏi trong câu trả lời (đúng trọng tâm)
+        overlap = len(answer_tokens & question_tokens)
+        score = overlap / len(question_tokens)
+        return max(0.0, min(1.0, float(score)))
 
     def evaluate_completeness(self, answer: str, expected: str) -> float:
         """
@@ -189,8 +224,18 @@ class RAGASEvaluator:
         Returns:
             float in [0.0, 1.0]
         """
-        # TODO
-        raise NotImplementedError("Implement evaluate_completeness")
+        # Tách các từ mang nội dung từ câu trả lời thực tế và câu trả lời mẫu (ground truth)
+        answer_tokens = _tokenize(answer)
+        expected_tokens = _tokenize(expected)
+
+        # Nếu câu trả lời mẫu rỗng, coi như đã đủ ý
+        if not expected_tokens:
+            return 1.0
+
+        # Đo độ đầy đủ: tỷ lệ các thông tin cốt lõi trong expected_answer được trả lời
+        overlap = len(answer_tokens & expected_tokens)
+        score = overlap / len(expected_tokens)
+        return max(0.0, min(1.0, float(score)))
 
     # -----------------------------------------------------------------------
     # Task 2b — Retrieval-side metrics (evaluate the GET-CONTEXT step)
@@ -211,8 +256,20 @@ class RAGASEvaluator:
 
         Low recall => retriever missed evidence the answer needs.
         """
-        # TODO
-        raise NotImplementedError("Implement evaluate_context_recall")
+        # Tách tokens từ expected answer
+        expected_tokens = _tokenize(expected)
+        if not expected_tokens:
+            return 1.0
+
+        # Hợp nhất tất cả các từ trong các đoạn chunks mà retriever đã lấy về
+        union_tokens: set[str] = set()
+        for chunk in contexts:
+            union_tokens.update(_tokenize(chunk))
+
+        # Context Recall: Đo lường xem ngữ cảnh tìm về có bao phủ hết thông tin cần thiết không
+        overlap = len(expected_tokens & union_tokens)
+        recall = overlap / len(expected_tokens)
+        return max(0.0, min(1.0, float(recall)))
 
     def evaluate_context_precision(
         self,
@@ -232,8 +289,35 @@ class RAGASEvaluator:
         Return 1.0 if expected empty; 0.0 if no chunks or none relevant.
         Reordering relevant chunks earlier (reranking) raises this score.
         """
-        # TODO
-        raise NotImplementedError("Implement evaluate_context_precision")
+        # Tách tokens từ câu trả lời kỳ vọng
+        expected_tokens = _tokenize(expected)
+        if not expected_tokens:
+            return 1.0
+        if not contexts:
+            return 0.0
+
+        # Bước 1: Xác định từng chunk có liên quan không dựa trên ngưỡng relevance_threshold
+        relevant_flags: list[int] = []
+        for chunk in contexts:
+            chunk_tokens = _tokenize(chunk)
+            coverage = len(chunk_tokens & expected_tokens) / len(expected_tokens)
+            relevant_flags.append(1 if coverage >= relevance_threshold else 0)
+
+        total_relevant = sum(relevant_flags)
+        if total_relevant == 0:
+            return 0.0
+
+        # Bước 2 & 3: Tính Precision@k và tích lũy Average Precision (AP@K) xếp hạng (rank-aware)
+        precision_sum = 0.0
+        cumulative_relevant = 0
+        for k, is_rel in enumerate(relevant_flags, start=1):
+            if is_rel:
+                cumulative_relevant += 1
+                precision_at_k = cumulative_relevant / k
+                precision_sum += precision_at_k
+
+        ap = precision_sum / total_relevant
+        return max(0.0, min(1.0, float(ap)))
 
     def run_full_eval(
         self,
@@ -265,8 +349,52 @@ class RAGASEvaluator:
         Returns:
             EvalResult with all fields populated.
         """
-        # TODO
-        raise NotImplementedError("Implement run_full_eval")
+        # 1. Tính toán 3 metric đánh giá chất lượng câu trả lời (Answer-side metrics)
+        faithfulness = self.evaluate_faithfulness(answer, context)
+        relevance = self.evaluate_relevance(answer, question)
+        completeness = self.evaluate_completeness(answer, expected)
+
+        # Đạt yêu cầu nếu cả 3 chỉ số đều >= 0.5
+        passed = bool(faithfulness >= 0.5 and relevance >= 0.5 and completeness >= 0.5)
+
+        # 2. Phân loại lỗi failure_type (nếu trượt, ưu tiên lấy lỗi đầu tiên thỏa điều kiện)
+        failure_type: str | None = None
+        if not passed:
+            if faithfulness < 0.3:
+                failure_type = "hallucination"
+            elif relevance < 0.3:
+                failure_type = "irrelevant"
+            elif completeness < 0.3:
+                failure_type = "incomplete"
+            else:
+                failure_type = "off_topic"
+
+        # 3. Tính toán 2 metric đánh giá khâu tìm kiếm (Retrieval-side metrics) nếu có contexts
+        context_recall: float | None = None
+        context_precision: float | None = None
+        if contexts is not None:
+            context_recall = self.evaluate_context_recall(contexts, expected)
+            context_precision = self.evaluate_context_precision(contexts, expected)
+
+        # Tạo đối tượng QAPair tương ứng
+        qa_pair = QAPair(
+            question=question,
+            expected_answer=expected,
+            context=context,
+            retrieved_contexts=contexts if contexts is not None else [],
+        )
+
+        return EvalResult(
+            qa_pair=qa_pair,
+            actual_answer=answer,
+            faithfulness=faithfulness,
+            relevance=relevance,
+            completeness=completeness,
+            passed=passed,
+            failure_type=failure_type,
+            context_precision=context_precision,
+            context_recall=context_recall,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -309,8 +437,8 @@ class LLMJudge:
     """
 
     def __init__(self, judge_llm_fn: Callable[[str], str]) -> None:
-        # TODO: store judge_llm_fn
-        pass
+        # Lưu hàm gọi mô hình LLM làm giám khảo (Judge LLM callable)
+        self.judge_llm_fn = judge_llm_fn
 
     def score_response(
         self,
@@ -342,8 +470,53 @@ class LLMJudge:
                 "reasoning": str,               # raw LLM explanation
             }
         """
-        # TODO
-        raise NotImplementedError("Implement score_response")
+        # Xây dựng prompt chứa câu hỏi, câu trả lời và bảng tiêu chí rubric
+        rubric_lines = "\n".join(f"- {criterion}: {desc}" for criterion, desc in rubric.items())
+        prompt = (
+            f"You are an impartial judge evaluating an AI response.\n"
+            f"Question: {question}\n"
+            f"Answer: {answer}\n\n"
+            f"Rubric criteria:\n{rubric_lines}\n\n"
+            f"Score each criterion from 0.0 to 1.0 and explain your reasoning.\n"
+            f"Return JSON: {{\"scores\": {{criterion: score}}, \"reasoning\": \"explanation\"}}"
+        )
+
+        # Gọi mô hình LLM judge
+        raw_response = self.judge_llm_fn(prompt)
+
+        scores: dict[str, float] = {}
+        reasoning: str = str(raw_response)
+
+        # Phân tích kết quả JSON trả về từ LLM
+        try:
+            match = re.search(r"\{.*\}", raw_response, re.DOTALL)
+            parsed = json.loads(match.group(0)) if match else json.loads(raw_response)
+            if isinstance(parsed, dict):
+                if "scores" in parsed and isinstance(parsed["scores"], dict):
+                    scores = {k: float(v) for k, v in parsed["scores"].items()}
+                    reasoning = str(parsed.get("reasoning", raw_response))
+                else:
+                    # Trường hợp JSON trả về trực tiếp dict điểm dạng {criterion: score}
+                    for k, v in parsed.items():
+                        if k in rubric and isinstance(v, (int, float)):
+                            scores[k] = float(v)
+                        elif isinstance(v, (int, float)):
+                            scores[k] = float(v)
+                    if "reasoning" in parsed and isinstance(parsed["reasoning"], str):
+                        reasoning = parsed["reasoning"]
+        except Exception:
+            # Nếu xảy ra lỗi parse JSON, giữ nguyên reasoning dạng text thô
+            pass
+
+        # Fallback an toàn: nếu tiêu chí nào chưa có điểm thì gán 0.5 mặc định
+        for criterion in rubric:
+            if criterion not in scores:
+                scores[criterion] = 0.5
+
+        return {
+            "scores": scores,
+            "reasoning": reasoning,
+        }
 
     def detect_bias(self, scores_batch: list[dict[str, Any]]) -> dict[str, Any]:
         """
@@ -364,8 +537,44 @@ class LLMJudge:
                 "severity_bias":   bool,
             }
         """
-        # TODO
-        raise NotImplementedError("Implement detect_bias")
+        # Thu thập toàn bộ điểm số của các tiêu chí trong batch đánh giá
+        all_scores: list[float] = []
+        first_item_scores: list[float] = []
+        subsequent_scores: list[float] = []
+
+        for idx, item in enumerate(scores_batch):
+            scores_dict = item.get("scores", {})
+            for val in scores_dict.values():
+                if isinstance(val, (int, float)):
+                    score_val = float(val)
+                    all_scores.append(score_val)
+                    if idx == 0:
+                        first_item_scores.append(score_val)
+                    else:
+                        subsequent_scores.append(score_val)
+
+        # Tính điểm trung bình cộng toàn batch
+        avg_total = sum(all_scores) / len(all_scores) if all_scores else 0.0
+
+        # Leniency bias (thiên vị dễ dãi): Điểm trung bình > 0.8 trên toàn bộ tiêu chí
+        leniency_bias = bool(avg_total > 0.8) if all_scores else False
+
+        # Severity bias (thiên vị quá khắt khe): Điểm trung bình < 0.3 trên toàn bộ tiêu chí
+        severity_bias = bool(avg_total < 0.3) if all_scores else False
+
+        # Positional bias (thiên vị thứ tự): Câu trả lời đầu tiên luôn có điểm trung bình cao hơn các câu sau
+        if first_item_scores and subsequent_scores:
+            avg_first = sum(first_item_scores) / len(first_item_scores)
+            avg_subsequent = sum(subsequent_scores) / len(subsequent_scores)
+            positional_bias = bool(avg_first > avg_subsequent)
+        else:
+            positional_bias = False
+
+        return {
+            "positional_bias": positional_bias,
+            "leniency_bias": leniency_bias,
+            "severity_bias": severity_bias,
+        }
 
 
 # ---------------------------------------------------------------------------
