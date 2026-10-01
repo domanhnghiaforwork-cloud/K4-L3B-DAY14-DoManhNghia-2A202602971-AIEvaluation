@@ -53,12 +53,17 @@ class QAPair:
         retrieved_contexts: List of retrieved chunks (ORDER = retriever rank).
                             Used by the retrieval-side metrics (Task 2b).
     """
-    # TODO: define fields
-    # Hints:
-    #   context: str = ""
-    #   metadata: dict = field(default_factory=dict)
-    #   retrieved_contexts: list = field(default_factory=list)
-    pass
+    #QAPair dữ liệu đầu vào
+    # Câu hỏi từ người dùng
+    question: str 
+    # Câu trả lời chuẩn (ground-truth) do chuyên gia con người viết sẵn
+    expected_answer: str
+    # Ngữ cảnh/tài liệu nguồn chuẩn (gold evidence) chứa thông tin để trả lời câu hỏi
+    context: str = ""
+    # metadata: Chứa nhãn phân loại (độ khó: easy, medium, hard, adversarial, danh mục sản phẩm, v.v.).
+    metadata: dict = field(default_factory=dict)
+    # Danh sách các đoạn văn bản (chunks) mà Retriever của hệ thống RAG thực tế đã tìm được (xếp theo thứ tự rank điểm số).
+    retrieved_contexts: list = field(default_factory=list)
 
 
 @dataclass
@@ -89,22 +94,31 @@ class EvalResult:
                         (Both stay None unless retrieved chunks are supplied;
                          they are NOT part of overall_score().)
     """
-    # TODO: define fields
-    # Hints:
-    #   failure_type: str | None = None
-    #   context_precision: float | None = None
-    #   context_recall: float | None = None
-    pass
+    # Dữ liệu đầu ra
+    # Tham chiếu ngược lại QAPair gốc để biết đang đánh giá câu hỏi nào.
+    qa_pair: QAPair
+    # Câu trả lời thực tế từ LLM/agent
+    actual_answer: str
+    #  Câu trả lời có bám sát context không, có bị "bịa đặt" (hallucination) không?0-1
+    faithfulness: float
+    # Câu trả lời có trả lời đúng trọng tâm câu hỏi không0-1
+    relevance: float
+    # Câu trả lời có đầy đủ ý so với expected_answer không?0-1
+    completeness: float
+
+    # Đánh dấu qua/trượt (pass/fail) dựa trên ngưỡng (ví dụ: tất cả >= 0.5)
+    passed: bool
+    failure_type: str | None = None
+    context_precision: float | None = None
+    context_recall: float | None = None
 
     def overall_score(self) -> float:
         """Compute the average of faithfulness, relevance, and completeness.
 
         Returns:
             (faithfulness + relevance + completeness) / 3.0
-
-        TODO: Return mean of the three metric scores
         """
-        raise NotImplementedError
+        return (self.faithfulness + self.relevance + self.completeness) / 3.0
 
 
 # ---------------------------------------------------------------------------
