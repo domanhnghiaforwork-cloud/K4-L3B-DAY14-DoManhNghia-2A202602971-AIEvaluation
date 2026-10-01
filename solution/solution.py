@@ -609,10 +609,28 @@ class BenchmarkRunner:
         Returns:
             List of EvalResult, one per qa_pair.
         """
-        # TODO: for each pair, call agent_fn(pair.question), then run_full_eval.
-        # Pass pair.retrieved_contexts as the optional contexts argument and
-        # preserve the original pair on the returned EvalResult.
-        raise NotImplementedError("Implement BenchmarkRunner.run")
+        results: list[EvalResult] = []
+        for pair in qa_pairs:
+            # 1. Gọi agent sinh câu trả lời cho câu hỏi đầu vào
+            answer = agent_fn(pair.question)
+
+            # 2. Truyền các chunk truy xuất được (retrieved_contexts) sang hàm đánh giá
+            retrieved = pair.retrieved_contexts if pair.retrieved_contexts else None
+
+            # 3. Chạy đánh giá toàn diện bằng evaluator
+            result = evaluator.run_full_eval(
+                answer=answer,
+                question=pair.question,
+                context=pair.context,
+                expected=pair.expected_answer,
+                contexts=retrieved,
+            )
+
+            # 4. Giữ nguyên đối tượng QAPair gốc (bao gồm đầy đủ metadata) trên EvalResult
+            result.qa_pair = pair
+            results.append(result)
+
+        return results
 
     def generate_report(self, results: list[EvalResult]) -> dict[str, Any]:
         """
@@ -634,8 +652,53 @@ class BenchmarkRunner:
         Average only non-None retrieval scores. Return None for a retrieval
         average when no result contains that metric.
         """
-        # TODO
-        raise NotImplementedError("Implement generate_report")
+        total = len(results)
+        if total == 0:
+            return {
+                "total": 0,
+                "passed": 0,
+                "pass_rate": 0.0,
+                "avg_faithfulness": 0.0,
+                "avg_relevance": 0.0,
+                "avg_completeness": 0.0,
+                "avg_context_recall": None,
+                "avg_context_precision": None,
+                "failure_types": {},
+            }
+
+        # Đếm số lượng ca kiểm thử đạt ngưỡng (pass)
+        passed_count = sum(1 for r in results if r.passed)
+        pass_rate = passed_count / total
+
+        # Tính trung bình cộng của 3 metric câu trả lời
+        avg_faithfulness = sum(r.faithfulness for r in results) / total
+        avg_relevance = sum(r.relevance for r in results) / total
+        avg_completeness = sum(r.completeness for r in results) / total
+
+        # Tính trung bình cộng của các chỉ số retrieval (chỉ tính các ca có giá trị khác None)
+        recalls = [r.context_recall for r in results if r.context_recall is not None]
+        avg_context_recall = sum(recalls) / len(recalls) if recalls else None
+
+        precisions = [r.context_precision for r in results if r.context_precision is not None]
+        avg_context_precision = sum(precisions) / len(precisions) if precisions else None
+
+        # Thống kê phân bổ số lượng lỗi theo từng failure_type
+        failure_types: dict[str, int] = {}
+        for r in results:
+            if not r.passed and r.failure_type is not None:
+                failure_types[r.failure_type] = failure_types.get(r.failure_type, 0) + 1
+
+        return {
+            "total": total,
+            "passed": passed_count,
+            "pass_rate": pass_rate,
+            "avg_faithfulness": avg_faithfulness,
+            "avg_relevance": avg_relevance,
+            "avg_completeness": avg_completeness,
+            "avg_context_recall": avg_context_recall,
+            "avg_context_precision": avg_context_precision,
+            "failure_types": failure_types,
+        }
 
     def run_regression(self, new_results: list, baseline_results: list) -> dict:
         """Compare new evaluation results against a baseline.
@@ -656,10 +719,41 @@ class BenchmarkRunner:
               - 'baseline_avg_completeness': float
               - 'regressions': list[str] — names of metrics that regressed
               - 'passed': bool — True if no regressions
-
-        TODO: Compute avg per metric, compare, list regressions, set passed flag
         """
-        raise NotImplementedError
+        # Tính điểm trung bình của lần chạy mới (new run)
+        new_count = len(new_results) or 1
+        new_avg_faithfulness = sum(r.faithfulness for r in new_results) / new_count
+        new_avg_relevance = sum(r.relevance for r in new_results) / new_count
+        new_avg_completeness = sum(r.completeness for r in new_results) / new_count
+
+        # Tính điểm trung bình của mốc cơ sở (baseline)
+        base_count = len(baseline_results) or 1
+        baseline_avg_faithfulness = sum(r.faithfulness for r in baseline_results) / base_count
+        baseline_avg_relevance = sum(r.relevance for r in baseline_results) / base_count
+        baseline_avg_completeness = sum(r.completeness for r in baseline_results) / base_count
+
+        # Phát hiện hồi quy: nếu bất kỳ metric nào giảm > 0.05 so với baseline
+        regressions: list[str] = []
+        if (baseline_avg_faithfulness - new_avg_faithfulness) > 0.05:
+            regressions.append("faithfulness")
+        if (baseline_avg_relevance - new_avg_relevance) > 0.05:
+            regressions.append("relevance")
+        if (baseline_avg_completeness - new_avg_completeness) > 0.05:
+            regressions.append("completeness")
+
+        # Đạt quality gate nếu không có metric nào bị hồi quy (drop > 0.05)
+        passed = (len(regressions) == 0)
+
+        return {
+            "new_avg_faithfulness": new_avg_faithfulness,
+            "new_avg_relevance": new_avg_relevance,
+            "new_avg_completeness": new_avg_completeness,
+            "baseline_avg_faithfulness": baseline_avg_faithfulness,
+            "baseline_avg_relevance": baseline_avg_relevance,
+            "baseline_avg_completeness": baseline_avg_completeness,
+            "regressions": regressions,
+            "passed": passed,
+        }
 
     def identify_failures(
         self,
@@ -676,8 +770,16 @@ class BenchmarkRunner:
         Returns:
             List of failing EvalResults.
         """
-        # TODO
-        raise NotImplementedError("Implement identify_failures")
+        # Lọc ra tất cả các ca có ít nhất một chỉ số thấp hơn ngưỡng chấp nhận
+        failures: list[EvalResult] = []
+        for r in results:
+            if (
+                r.faithfulness < threshold
+                or r.relevance < threshold
+                or r.completeness < threshold
+            ):
+                failures.append(r)
+        return failures
 
 
 # ---------------------------------------------------------------------------
@@ -711,8 +813,12 @@ class FailureAnalyzer:
             dict mapping failure_type → count.
             Example: {"hallucination": 3, "irrelevant": 2, "incomplete": 5}
         """
-        # TODO
-        raise NotImplementedError("Implement categorize_failures")
+        # Nhóm và đếm số lượng lỗi theo từng nhãn failure_type
+        counts: dict[str, int] = {}
+        for f in failures:
+            ftype = f.failure_type if f.failure_type is not None else "unknown"
+            counts[ftype] = counts.get(ftype, 0) + 1
+        return counts
 
     def find_root_cause(self, failure: EvalResult) -> str:
         """
@@ -724,8 +830,26 @@ class FailureAnalyzer:
             "Answer is missing key information — increase context window or improve generation"
             "Multiple issues detected — review full pipeline"
         """
-        # TODO: compare faithfulness, relevance, completeness, return appropriate string
-        raise NotImplementedError("Implement find_root_cause")
+        f = failure.faithfulness
+        r = failure.relevance
+        c = failure.completeness
+
+        # Tìm giá trị điểm số nhỏ nhất trong 3 tiêu chí
+        min_score = min(f, r, c)
+        lowest_metrics = [name for name, score in [("f", f), ("r", r), ("c", c)] if score == min_score]
+
+        # Nếu có nhiều hơn 1 tiêu chí cùng thấp nhất (bằng nhau) -> nhiều vấn đề đồng thời
+        if len(lowest_metrics) > 1:
+            return "Multiple issues detected — review full pipeline"
+        elif lowest_metrics[0] == "f":
+            # Điểm faithfulness thấp nhất -> Context nguồn không hỗ trợ câu trả lời
+            return "Context is missing or irrelevant — improve retrieval"
+        elif lowest_metrics[0] == "r":
+            # Điểm relevance thấp nhất -> Câu trả lời không bám sát câu hỏi
+            return "Answer does not address the question — improve prompt clarity"
+        else:
+            # Điểm completeness thấp nhất -> Thiếu ý cốt lõi từ expected answer
+            return "Answer is missing key information — increase context window or improve generation"
 
     def generate_improvement_log(self, failures: list, suggestions: list[str]) -> str:
         """Generate a Markdown table logging failures and improvement actions.
@@ -741,10 +865,28 @@ class FailureAnalyzer:
 
         Returns:
             Markdown table string with a row per failure. Status is always "Open".
-
-        TODO: Build markdown table with failure details + matched suggestions
         """
-        raise NotImplementedError
+        lines = [
+            "| Failure ID | Type | Root Cause | Suggested Fix | Status |",
+            "|------------|------|------------|---------------|--------|",
+        ]
+        # Xây dựng từng dòng tương ứng với mỗi failure ca lỗi
+        for idx, failure in enumerate(failures, start=1):
+            fid = f"F{idx:03d}"
+            ftype = str(failure.failure_type if failure.failure_type is not None else "Unknown")
+            root_cause = self.find_root_cause(failure)
+
+            # Khớp đề xuất hành động sửa lỗi tương ứng
+            if idx - 1 < len(suggestions):
+                fix = suggestions[idx - 1]
+            elif suggestions:
+                fix = suggestions[0]
+            else:
+                fix = "Review pipeline components and tune parameters"
+
+            lines.append(f"| {fid} | {ftype} | {root_cause} | {fix} | Open |")
+
+        return "\n".join(lines)
 
     def generate_improvement_suggestions(
         self, failures: list[EvalResult]
@@ -762,8 +904,37 @@ class FailureAnalyzer:
         Returns:
             List of at least 3 suggestion strings (or fewer if failures is empty).
         """
-        # TODO: analyze categorized failures and return suggestions
-        raise NotImplementedError("Implement generate_improvement_suggestions")
+        # Nếu không có lỗi nào, trả về danh sách rỗng
+        if not failures:
+            return []
+
+        suggestions: list[str] = []
+        categories = self.categorize_failures(failures)
+
+        # Đề xuất cải tiến dựa trên các cụm lỗi (Failure Clustering)
+        if categories.get("hallucination", 0) > 0 or categories.get("Hallucination", 0) > 0:
+            suggestions.append("Implement hallucination checker to filter unsupported claims")
+            suggestions.append("Increase chunk size in RAG pipeline to reduce context fragmentation")
+
+        if categories.get("irrelevant", 0) > 0 or categories.get("off_topic", 0) > 0:
+            suggestions.append("Refine prompt clarity and add few-shot examples to maintain question focus")
+            suggestions.append("Add query rewriting step to improve question relevance")
+
+        if categories.get("incomplete", 0) > 0 or categories.get("Low_completeness", 0) > 0:
+            suggestions.append("Add few-shot examples showing complete answers to improve completeness")
+            suggestions.append("Expand context window or retrieval top-k to provide all required facts")
+
+        # Luôn đảm bảo có ít nhất 3 đề xuất cụ thể, khả thi
+        default_actions = [
+            "Increase chunk size in RAG pipeline to reduce context fragmentation",
+            "Add few-shot examples showing complete answers to improve completeness",
+            "Implement hallucination checker to filter unsupported claims",
+        ]
+        for act in default_actions:
+            if act not in suggestions:
+                suggestions.append(act)
+
+        return suggestions
 
 
 # ---------------------------------------------------------------------------
